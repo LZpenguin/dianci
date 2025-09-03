@@ -1,3 +1,9 @@
+# custom
+/data/
+/models/
+/em_foundation_model/9G4B/
+/em_foundation_model/em_foundation/weight/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

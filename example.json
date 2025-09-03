@@ -1,0 +1,47 @@
+{
+    "team_name": "SignalMasters",
+	"model_name": "YourModelName-vX.0",
+    "evaluation_time": "YYYY-MM-DD HH:MM:SS",
+    "answers": [
+        {
+            "id": 0,
+            "pred": "A"
+        },
+        {
+            "id": 1,
+            "pred": "B"
+        },
+        {
+            "id": 2,
+            "pred": "C"
+        },
+        {
+            "id": 3,
+            "pred": "D"
+        },
+		{
+            "id": 4,
+            "pred": "A"
+        },
+        {
+            "id": 5,
+            "pred": "B"
+        },
+        {
+            "id": 6,
+            "pred": "C"
+        },
+        {
+            "id": 7,
+            "pred": "D"
+        },
+		{
+            "id": 8,
+            "pred": "A"
+        },
+        {
+            "id": 9,
+            "pred": "B"
+        }
+    ]
+}
