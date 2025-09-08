@@ -11,7 +11,7 @@ import glob
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, AutoModelForCausalLM, get_linear_schedule_with_warmup
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, get_peft_model, PeftModel
 from accelerate import Accelerator
 from argparse import ArgumentParser
 import sys
@@ -33,7 +33,7 @@ from models.configuration_em import SiTMAEConfig
 from models.modeling_em   import SiTMAEModelWithoutMask as SiTMAEModel
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.tensorboard import SummaryWriter
-from torch.utils.data import Dataset, DataLoader, Subset
+from torch.utils.data import Dataset, DataLoader, Subset, ConcatDataset
 
 LOG_FILENAME = os.path.join(".", 'train.log')
 logging.basicConfig(
@@ -50,6 +50,8 @@ def parse_args():
     parser = ArgumentParser()
     parser.add_argument('--llm-model-path', type=str, required=True,
                         help='本地 LLM 模型和 tokenizer 目录')
+    parser.add_argument('--trained-dir', type=str, default=None,
+                        help='继续训练的模型路径')
     parser.add_argument('--task-dir', type=str, default=None,
                         help='存放所有 h5/json 文件的目录，按同名配对')
     parser.add_argument('--task-files', nargs='+',
@@ -77,7 +79,8 @@ def parse_args():
 
 
 class MultiModalDataset(Dataset):
-    def __init__(self, task_files, tokenizer, max_length=512):
+    def __init__(self, task_files, tokenizer, max_length=512, test_mode=False):
+        self.test_mode = test_mode
         self.samples = []
         self.tokenizer = tokenizer
         self.max_length = max_length
@@ -91,6 +94,14 @@ class MultiModalDataset(Dataset):
             entries = json.load(open(json_path, 'r', encoding='utf-8'))
             for item in entries:
                 item['h5_path'] = h5_path
+                if 'Answer choices' in item:
+                    item['question'] = item['question'] + ' '.join(item['Answer choices'])
+                item['question'] = item['question'] + self.tokenizer.bos_token
+                if 'answer' in item:
+                    for a in ['A', 'B', 'C', 'D']:
+                        if f'({a})' in item['answer']:
+                            item['answer'] = item['answer'].split(f'({a})')[1].strip()
+                            break
                 self.samples.append(item)
 
     def __len__(self):
@@ -106,13 +117,15 @@ class MultiModalDataset(Dataset):
         iq = iq / m                                  
         # 文本编码：仅 question + answer（后面模型 forward 里再插 IQ special tokens）
         question = item['question']
-        answer   = item['answer'] if 'answer' in item else ''
-        prompt = question + self.tokenizer.eos_token + ((answer + self.tokenizer.eos_token) if 'answer' in item else '')
+        answer   = item.get('answer', '')
+        
+        prompt = question + ((answer + self.tokenizer.eos_token) if answer and not self.test_mode else '')
         inputs = self.tokenizer(
             prompt,
             truncation=True,
             max_length=self.max_length,
-            return_tensors='pt'
+            return_tensors='pt',
+            add_special_tokens=False
         )
         input_ids = inputs.input_ids.squeeze(0)
         attention_mask = inputs.attention_mask.squeeze(0)
@@ -191,6 +204,7 @@ class MultiModalModel(nn.Module):
     def __init__(self, signal_encoder, llm, tokenizer, use_lora=False,
                  lora_r=8, lora_alpha=16, lora_dropout=0.1):
         super().__init__()
+        self.tokenizer = tokenizer
         self.signal_encoder = signal_encoder
         # 特殊 token id，供 forward 时插入
         self.iq_start_id = tokenizer.convert_tokens_to_ids("<IQ_START>")
@@ -220,7 +234,7 @@ class MultiModalModel(nn.Module):
         else:
             self.llm = llm
 
-    def forward(self, iq, input_ids, attention_mask):
+    def forward(self, iq, input_ids, attention_mask, generate=False):
         # 信号编码
         # —— 1) Patchify —— #
         B, L, C = iq.shape
@@ -267,19 +281,54 @@ class MultiModalModel(nn.Module):
                                  dtype=attention_mask.dtype,
                                  device=attention_mask.device)
         attention_mask = torch.cat([prefix_mask, attention_mask], dim=1)
-        # —— 6) labels 拼接（prefix 全部忽略） —— #
-        labels = torch.cat([
+        # —— 6) labels 拼接（最后一个bos_token_id之前全部忽略） —— #
+        # 先创建完整的labels
+        full_labels = torch.cat([
             torch.full((B, prefix_len), -100, device=input_ids.device),
             input_ids
         ], dim=1)
+        
+        # 找到每个样本中最后一个bos_token_id的位置，并将其之前的所有token设为-100
+        bos_token_id = self.tokenizer.bos_token_id
+        labels = full_labels.clone()
+        
+        for i in range(B):
+            # 在input_ids中找到最后一个bos_token_id的位置
+            bos_positions = (input_ids[i] == bos_token_id).nonzero(as_tuple=True)[0]
+            if len(bos_positions) > 0:
+                last_bos_pos = bos_positions[-1].item()
+                # 将最后一个bos_token_id之前的所有位置设为-100（包括prefix部分）
+                labels[i, :prefix_len + last_bos_pos + 1] = -100
         # 前向
-        outputs = self.llm(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            labels=labels
-        )
+        if generate:
+            while True:
+                outputs = self.llm(
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=attention_mask
+                )
+                new_token_ids = outputs.logits.argmax(dim=-1)[:, -1:]
+                if new_token_ids[0][-1] == 73440:
+                    return outputs, input_ids
+                new_token_embeds = self.embed_layer(new_token_ids)
+                inputs_embeds = torch.cat([inputs_embeds, new_token_embeds], dim=1)
+        else:
+            outputs = self.llm(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                labels=labels
+            )
         return outputs
 
+def merge_lora_weights(base_model, lora_model):
+    # 遍历模型中的所有层
+    for name, param in base_model.named_parameters():
+        if name in lora_model.peft_config:
+            # 获取 LoRA 层的权重
+            lora_weights = lora_model.get_lora_weights(name)
+            
+            # 合并 LoRA 权重到原始权重
+            param.data += lora_weights.data
+    return base_model
 
 def main():
     args = parse_args()
@@ -329,6 +378,7 @@ def main():
         torch_dtype=torch.float16,
     )
     llm.resize_token_embeddings(len(tokenizer))
+
     # —— 实例化 EM 基础模型作为 signal_encoder —— 
     # 这里 SiTMAEConfig() 可根据需要传入自定义参数
     # —— 用专用函数加载并转换到“无 Mask”模型 —— 
@@ -337,6 +387,7 @@ def main():
         max_seq_len=(4096,1),
         use_fs=True,
         fs=20e6,      # e.g. 1e6 表示 1MHz
+        patch_size=(4, 1)
     )
     # 先加载带 Mask 的骨干并对齐权重
     base_encoder = load_sit_encoder_model(em_config, args.signal_encoder_path)
@@ -362,7 +413,13 @@ def main():
         ]
 
     # 模型构建，可选 LoRA
-    model = MultiModalModel(signal_encoder, llm, tokenizer, use_lora=args.use_lora)
+    model = MultiModalModel(signal_encoder, llm, tokenizer, use_lora=args.use_lora and not args.trained_dir)
+    if args.trained_dir:
+        # 获取当前设备，避免CUDA设备映射错误
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model.llm = PeftModel.from_pretrained(model.llm, args.trained_dir)
+        model.signal_encoder.load_state_dict(torch.load(os.path.join(args.trained_dir, "signal_encoder.pt"), map_location=device), strict=False)
+        model.signal_to_hidden.load_state_dict(torch.load(os.path.join(args.trained_dir, "signal_to_hidden.pt"), map_location=device), strict=False)
     # 冻结 Base Model（保留 Adapter 可训练）
     if args.freeze_llm:
         # 如果使用了 LoRA，model.llm.base_model 是原始模型
@@ -384,13 +441,18 @@ def main():
     train_indices = indices[50:]
     train_dataset = Subset(full_dataset, train_indices)
     val_dataset   = Subset(full_dataset, val_indices)
+    
+    # 方法1：使用ConcatDataset重复数据集epoch次
+    repeated_datasets = [train_dataset for _ in range(args.epochs)]
+    repeated_train_dataset = ConcatDataset(repeated_datasets)
+    
     # 实例化collator
     collator = DynamicIQCollator(tokenizer, patch_size)
-    # DataLoader 里直接传入
+    # DataLoader 里直接传入，shuffle=True会自动打乱所有重复的数据
     train_loader = DataLoader(
-        train_dataset,
+        repeated_train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=True,  # 这会打乱所有重复的数据
         num_workers=32,              
         pin_memory=True,         
         collate_fn=collator
@@ -405,10 +467,10 @@ def main():
     )
     # 优化器：仅对需要梯度的参数
     optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
-    num_update_steps = len(train_loader) * args.epochs
+    num_update_steps = len(train_loader)
     lr_scheduler = get_linear_schedule_with_warmup(
         optimizer,
-        num_warmup_steps=int(0.1 * num_update_steps),
+        num_warmup_steps=int(0.1 * num_update_steps) if not args.trained_dir else int(0.01 * num_update_steps),
         num_training_steps=num_update_steps
     )
     # 只给训练用的 loader 做分布式封装，验证 loader 保留原始 sampler
@@ -419,7 +481,8 @@ def main():
     global_step = 0
     
     # 创建总的训练进度条，仅在主进程显示
-    total_steps = len(train_loader) * args.epochs
+    # 注意：由于使用了ConcatDataset，train_loader已经包含了所有epoch的数据
+    total_steps = len(train_loader)  # 不需要乘以args.epochs
     if accelerator.is_local_main_process:
         overall_progress = tqdm(
             total=total_steps,
@@ -428,160 +491,127 @@ def main():
             dynamic_ncols=True
         )
     
-    for epoch in range(args.epochs):
-        epoch_loss = 0.0
-        for step, batch in enumerate(train_loader):
-            outputs = model(batch['iq'], batch['input_ids'], batch['attention_mask'])
-            loss = outputs.loss
-            accelerator.backward(loss)
-            optimizer.step()
-            lr_scheduler.step()
-            optimizer.zero_grad()
-            # TensorBoard: 写入当前 loss
-            writer.add_scalar("train/loss_step", loss.item(), global_step)
-            # Wandb: 记录训练指标
-            if accelerator.is_local_main_process:
-                wandb.log({
-                    "train/loss_step": loss.item(),
-                    "train/learning_rate": lr_scheduler.get_last_lr()[0],
-                    "train/epoch": epoch,
-                    "train/global_step": global_step
-                }, step=global_step)
-            
-            epoch_loss += loss.item()
-            global_step += 1
-            
-            # 更新总进度条显示信息
-            if accelerator.is_local_main_process:
-                avg_loss = epoch_loss / (step + 1)
-                current_lr = lr_scheduler.get_last_lr()[0]
-                overall_progress.set_postfix({
-                    'epoch': f'{epoch+1}/{args.epochs}',
-                    'loss': f'{loss.item():.4f}',
-                    'avg_loss': f'{avg_loss:.4f}',
-                    'lr': f'{current_lr:.2e}'
-                })
-                overall_progress.update(1)
-
-            if step % 50 == 0:
-                avg = epoch_loss / (step + 1)
-                if accelerator.is_local_main_process:
-                    logger.info(f"Epoch {epoch}, Step {step}, Loss: {loss.item():.4f}, Avg: {avg:.4f}")
-
-            if global_step % 1000 == 0:
-                # 1) 保存当前模型（unwrap 后才能 save_pretrained）
-                ckpt_dir = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                os.makedirs(ckpt_dir, exist_ok=True)
-                raw = accelerator.unwrap_model(model)
-                raw.llm.save_pretrained(ckpt_dir)
-                tokenizer.save_pretrained(ckpt_dir)
-                torch.save(raw.signal_to_hidden.state_dict(), os.path.join(ckpt_dir, "signal_to_hidden.pt"))
-                torch.save(raw.signal_encoder.state_dict(),    os.path.join(ckpt_dir, "signal_encoder.pt"))
-                
-                # Wandb: 保存模型检查点作为artifact
-                if accelerator.is_local_main_process:
-                    artifact = wandb.Artifact(f"model-checkpoint-{global_step}", type="model")
-                    artifact.add_dir(ckpt_dir)
-                    wandb.log_artifact(artifact)
-
-                # 2) 验证 & 打印，仅在主进程
-                if accelerator.is_local_main_process:
-                    logger.info(f"\n>>> Validation at step {global_step}")
-                    model.eval()
-                    val_loss = 0.0
-                    with torch.no_grad():
-                        # 为验证过程添加进度条
-                        val_progress = tqdm(
-                            val_loader,
-                            desc="Validation",
-                            leave=False,
-                            dynamic_ncols=True
-                        )
-                        for vb in val_progress:
-                            out = model(vb['iq'], vb['input_ids'], vb['attention_mask'])
-                            batch_loss = out.loss.item()
-                            val_loss += batch_loss
-                            # 更新验证进度条
-                            val_progress.set_postfix({'val_loss': f'{batch_loss:.4f}'})
-                    val_loss /= len(val_loader)
-                    logger.info(f"  → Val Loss: {val_loss:.4f}")
-                    
-                    # Wandb: 记录验证指标
-                    wandb.log({
-                        "val/loss": val_loss,
-                        "val/global_step": global_step
-                    }, step=global_step)
-
-                    # 3) 随机打印 10 个样例，用 "unwrap 后" 的模型 & no_grad
-                    sample_v = random.sample(val_indices, k=10)
-                    logger.info(f"  → Sample validation IDs: {sample_v}")
-                    # 拿到原始模型（去掉 DDP 壳），eval + 关掉grad
-                    raw_model = accelerator.unwrap_model(model)
-                    raw_model.eval()
-                    
-                    # 创建wandb表格来保存推理结果
-                    inference_data = []
-                    
-                    with torch.no_grad():
-                        for i, vid in enumerate(sample_v):
-                            meta = full_dataset.samples[vid]
-                            question = meta['question']
-                            gt_answer = meta['answer']
-                            data = full_dataset[vid]
-                            iq   = data['iq'].unsqueeze(0).to(device)
-                            ids  = data['input_ids'].unsqueeze(0).to(device)
-                            mask = data['attention_mask'].unsqueeze(0).to(device)
-                
-                            out  = raw_model(iq, ids, mask)
-                            pred = out.logits.argmax(dim=-1)[0]
-                            B, L, C = iq.shape
-                            P = patch_size[0]
-                            prefix_len = 1 + (L // P) + 1
-                            text_pred = pred[prefix_len:]
-                            q_ids = tokenizer(question + tokenizer.eos_token,
-                                              return_tensors='pt').input_ids[0]
-                            ans_ids = text_pred[q_ids.size(0):]
-                            answer = tokenizer.decode(ans_ids,
-                                                      skip_special_tokens=True).strip()
-                            
-                            # 收集推理结果数据
-                            inference_data.append([
-                                vid,  # 样本ID
-                                question,  # 问题
-                                answer,  # 预测答案
-                                gt_answer,  # 真实答案
-                                len(question),  # 问题长度
-                                len(answer),  # 预测答案长度
-                                len(gt_answer),  # 真实答案长度
-                                answer == gt_answer  # 是否完全匹配
-                            ])
-                            
-                            logger.info(f"→ Q:{question!r}\n→ Pred: {answer}\n→ GT: {gt_answer!r}\n")
-                    
-                    # 创建并记录wandb表格
-                    inference_table = wandb.Table(
-                        columns=[
-                            "Sample_ID", "Question", "Predicted_Answer", "Ground_Truth", 
-                            "Question_Length", "Pred_Length", "GT_Length", "Exact_Match"
-                        ],
-                        data=inference_data
-                    )
-                    
-                    wandb.log({
-                        f"inference_results/step_{global_step}": inference_table,
-                        "inference_results/exact_match_rate": sum(row[7] for row in inference_data) / len(inference_data)
-                    }, step=global_step)
-                    model.train()
-        # 每个 epoch 写一次平均 loss
-        avg_epoch_loss = epoch_loss / len(train_loader)
-        writer.add_scalar("train/loss_epoch", avg_epoch_loss, epoch)
-        
-        # Wandb: 记录每个epoch的平均loss
+    for step, batch in enumerate(train_loader):
+        outputs = model(batch['iq'], batch['input_ids'], batch['attention_mask'])
+        loss = outputs.loss
+        accelerator.backward(loss)
+        optimizer.step()
+        lr_scheduler.step()
+        optimizer.zero_grad()
+        # TensorBoard: 写入当前 loss
+        writer.add_scalar("train/loss_step", loss.item(), global_step)
+        # Wandb: 记录训练指标
         if accelerator.is_local_main_process:
             wandb.log({
-                "train/loss_epoch": avg_epoch_loss,
-                "epoch": epoch
+                "train/loss_step": loss.item(),
+                "train/learning_rate": lr_scheduler.get_last_lr()[0],
+                "train/global_step": global_step
             }, step=global_step)
+        
+        global_step += 1
+        
+        # 更新总进度条显示信息
+        if accelerator.is_local_main_process:
+            current_lr = lr_scheduler.get_last_lr()[0]
+            overall_progress.set_postfix({
+                'loss': f'{loss.item():.4f}',
+                'lr': f'{current_lr:.2e}'
+            })
+            overall_progress.update(1)
+        if global_step % 500 == 0:
+            # 1) 保存当前模型（unwrap 后才能 save_pretrained）
+            ckpt_dir = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+            os.makedirs(ckpt_dir, exist_ok=True)
+            raw = accelerator.unwrap_model(model)
+            raw.llm.save_pretrained(ckpt_dir, save_embedding_layers=True)
+            tokenizer.save_pretrained(ckpt_dir)
+            torch.save(raw.signal_to_hidden.state_dict(), os.path.join(ckpt_dir, "signal_to_hidden.pt"))
+            torch.save(raw.signal_encoder.state_dict(),    os.path.join(ckpt_dir, "signal_encoder.pt"))
+            # 2) 验证 & 打印，仅在主进程
+            if accelerator.is_local_main_process:
+                model.eval()
+                val_loss = 0.0
+                with torch.no_grad():
+                    # 为验证过程添加进度条
+                    val_progress = tqdm(
+                        val_loader,
+                        desc="Validation",
+                        leave=False,
+                        dynamic_ncols=True
+                    )
+                    for vb in val_progress:
+                        out = model(vb['iq'], vb['input_ids'], vb['attention_mask'])
+                        batch_loss = out.loss.item()
+                        val_loss += batch_loss
+                        # 更新验证进度条
+                        val_progress.set_postfix({'val_loss': f'{batch_loss:.4f}'})
+                val_loss /= len(val_loader)
+                
+                # Wandb: 记录验证指标
+                wandb.log({
+                    "val/loss": val_loss,
+                    "val/global_step": global_step
+                }, step=global_step)
+                # 3) 随机打印 10 个样例，用 "unwrap 后" 的模型 & no_grad
+                # sample_v = random.sample(val_indices, k=10)
+                sample_v = val_indices
+                # logger.info(f"  → Sample validation IDs: {sample_v}")
+                # 拿到原始模型（去掉 DDP 壳），eval + 关掉grad
+                raw_model = accelerator.unwrap_model(model)
+                raw_model.eval()
+                
+                # 创建wandb表格来保存推理结果
+                inference_data = []
+                
+                with torch.no_grad():
+                    for i, vid in enumerate(sample_v):
+                        meta = full_dataset.samples[vid]
+                        question = meta['question']
+                        gt_answer = meta['answer']
+                        data = full_dataset[vid]
+                        iq   = data['iq'].unsqueeze(0).to(device)
+                        ids  = data['input_ids'].unsqueeze(0).to(device)
+                        mask = data['attention_mask'].unsqueeze(0).to(device)
+            
+                        out  = raw_model(iq, ids, mask)
+                        pred = out.logits.argmax(dim=-1)[0]
+                        B, L, C = iq.shape
+                        P = patch_size[0]
+                        prefix_len = 1 + (L // P) + 1
+                        text_pred = pred[prefix_len:]
+                        q_ids = tokenizer(question, return_tensors='pt', add_special_tokens=False).input_ids[0]
+                        ans_ids = text_pred[q_ids.size(0)-1:]
+                        answer = tokenizer.decode(ans_ids,
+                                                  skip_special_tokens=True).strip()
+                        
+                        # 收集推理结果数据
+                        inference_data.append([
+                            vid,  # 样本ID
+                            question,  # 问题
+                            answer,  # 预测答案
+                            gt_answer,  # 真实答案
+                            len(question),  # 问题长度
+                            len(answer),  # 预测答案长度
+                            len(gt_answer),  # 真实答案长度
+                            answer in gt_answer  # 是否完全匹配
+                        ])
+                        
+                        # logger.info(f"\n→ Q:{question!r}\n→ Pred: {answer}\n→ GT: {gt_answer!r}\n")
+                
+                # 创建并记录wandb表格
+                inference_table = wandb.Table(
+                    columns=[
+                        "Sample_ID", "Question", "Predicted_Answer", "Ground_Truth", 
+                        "Question_Length", "Pred_Length", "GT_Length", "Exact_Match"
+                    ],
+                    data=inference_data
+                )
+                
+                wandb.log({
+                    f"inference_results/step_{global_step}": inference_table,
+                    "inference_results/exact_match_rate": sum(row[7] for row in inference_data if '(A)' in row[1]) / len([row for row in inference_data if '(A)' in row[1]])
+                }, step=global_step)
+                model.train()
     
     # 关闭总进度条
     if accelerator.is_local_main_process:
@@ -593,28 +623,6 @@ def main():
     # 关闭 Wandb
     if accelerator.is_local_main_process:
         wandb.finish()
-    
-    # 保存模型与 tokenizer
-    unwrapped_model = accelerator.unwrap_model(model)
-    # 保存 LLM & tokenizer
-    unwrapped_model.llm.save_pretrained(args.output_dir)
-    tokenizer.save_pretrained(args.output_dir)
-    # 保存 signal_to_hidden MLP & signal_encoder
-    torch.save(
-        unwrapped_model.signal_to_hidden.state_dict(),
-        os.path.join(args.output_dir, "signal_to_hidden.pt")
-    )
-    torch.save(
-        unwrapped_model.signal_encoder.state_dict(),
-        os.path.join(args.output_dir, "signal_encoder.pt")
-    )
-    
-    # Wandb: 保存最终模型作为artifact
-    if accelerator.is_local_main_process:
-        final_artifact = wandb.Artifact("final-model", type="model")
-        final_artifact.add_dir(args.output_dir)
-        wandb.log_artifact(final_artifact)
-        logger.info("Final model saved to wandb as artifact")
 
 
 if __name__ == '__main__':

@@ -3,6 +3,7 @@
 /models/
 /em_foundation_model/9G4B/
 /em_foundation_model/em_foundation/weight/
+em_foundation_model/em_foundation/wandb/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
